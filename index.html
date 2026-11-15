@@ -73,6 +73,11 @@ label.f{display:grid;gap:2px;font-style:italic}
 .subfigs button{font:inherit;border:0;background:none;padding:0;cursor:pointer;color:var(--ink);text-decoration:underline;text-decoration-color:var(--faint);text-underline-offset:4px}
 .subfigs button:hover{text-decoration-color:var(--ink)}
 .subfigs button[aria-pressed="true"]{font-weight:700;text-decoration:none}
+.subfigs button:disabled{color:var(--faint);text-decoration:none;cursor:default}
+.lockbox{margin:22px 0 0;padding:14px 0 0;border-top:1px solid var(--ink)}
+.lockbox p{text-align:justify;hyphens:auto;-webkit-hyphens:auto;font-size:16px}
+.lockbox .row{display:flex;flex-wrap:wrap;gap:10px}
+.pt.fixed{cursor:default}
 
 /* layout: figure + table */
 .stage{display:grid;grid-template-columns:minmax(0,1fr);gap:28px 48px;align-items:start}
@@ -162,7 +167,7 @@ legend{padding:0;margin:0 0 6px}
 <body>
 <div class="page">
   <header class="titleblock">
-    <h1>Voice of the People<span class="sub">A crowd-sourced study of where everyone stands</span></h1>
+    <h1>Voice of the People<span class="sub">Towards the theory of PhD students’ character classification</span></h1>
     <p class="author">Anonymous et al.</p>
     <p class="date" id="date"></p>
     <nav class="contents" id="nav" aria-label="Contents"></nav>
@@ -230,7 +235,8 @@ async function makeLiveStore() {
     watchMyCharts: (uid, cb, err) => F.onSnapshot(F.query(col("charts"), F.where("proposedBy", "==", uid)), s => cb(rows(s)), err),
     watchAllCharts: (cb, err) => F.onSnapshot(col("charts"), s => cb(rows(s)), err),
     watchStudents: (cb, err) => F.onSnapshot(col("students"), s => cb(rows(s)), err),
-    watchVotes: (cb, err) => F.onSnapshot(col("votes"), s => { const m = new Map(); s.docs.forEach(d => m.set(d.id, (d.data() || {}).p || {})); cb(m); }, err),
+    watchLocks: (cb, err) => F.onSnapshot(col("locks"), s => cb(rows(s)), err),
+    lockChart: (voteId, cid, p) => F.setDoc(ref("locks", voteId + "_" + cid), { v: voteId, c: cid, p }),
     async loadBallot(uid) {
       const b = await F.getDoc(ref("ballots", uid));
       if (!b.exists()) return null;
@@ -260,13 +266,13 @@ function makeDemoStore() {
   const D = {
     charts: [{ id: "demo1", a1l: "Axis 1 Left", a1r: "Axis 1 Right", a2l: "Axis 2 Left", a2r: "Axis 2 Right", status: "live", proposedBy: "x", createdAt: 1 }],
     students: [{ id: "s1", name: "Student 1", order: 1 }, { id: "s2", name: "Student 2", order: 2 }],
-    votes: new Map(), admins: [],
+    votes: new Map(), locks: [], admins: [],
   };
   const centres = { s1: [-.45, .45], s2: [.4, -.35] };
   for (let i = 0; i < 9; i++) {
     const p = { demo1: {} };
     for (const s in centres) p.demo1[s] = [clamp1(centres[s][0] + rn() * .3), clamp1(centres[s][1] + rn() * .3)];
-    D.votes.set("v" + i, p);
+    D.locks.push({ id: "v" + i + "_demo1", v: "v" + i, c: "demo1", p: p.demo1 });
   }
   const subs = [];
   const sub = (get, cb) => { const s = { get, cb }; subs.push(s); setTimeout(() => cb(get()), 0); return () => { const i = subs.indexOf(s); if (i >= 0) subs.splice(i, 1); }; };
@@ -282,7 +288,8 @@ function makeDemoStore() {
     watchMyCharts: (uid, cb) => sub(() => D.charts.filter(c => c.proposedBy === uid).map(c => ({ ...c })), cb),
     watchAllCharts: cb => sub(() => D.charts.map(c => ({ ...c })), cb),
     watchStudents: cb => sub(() => D.students.map(s => ({ ...s })), cb),
-    watchVotes: cb => sub(() => new Map([...D.votes].map(([k, v]) => [k, clone(v)])), cb),
+    watchLocks: cb => sub(() => D.locks.map(clone), cb),
+    async lockChart(voteId, cid, p) { if (D.locks.some(l => l.v === voteId && l.c === cid)) throw { code: "permission-denied" }; D.locks.push({ id: voteId + "_" + cid, v: voteId, c: cid, p: clone(p) }); emit(); },
     loadBallot: async () => ballot ? { voteId: ballot, p: clone(D.votes.get(ballot) || {}) } : null,
     async saveVote(u, voteId, p) { ballot = voteId || "mine"; D.votes.set(ballot, clone(p)); emit(); return ballot; },
     async propose(u, f, live) { D.charts.push({ id: "c" + Date.now(), ...f, status: live ? "live" : "proposed", proposedBy: u.uid, createdAt: Date.now() }); emit(); },
@@ -300,7 +307,7 @@ function makeDemoStore() {
 let store = null;
 const A = {
   authReady: false, user: null, admin: false, linkNeedsEmail: false, fatal: "", error: "", note: "",
-  liveCharts: [], myCharts: [], allCharts: [], students: [], votes: new Map(), admins: [],
+  liveCharts: [], myCharts: [], allCharts: [], students: [], locks: [], admins: [],
   myVoteId: null, mine: {}, mineLoaded: false,
   chartId: (() => { try { return localStorage.getItem("vp-chart"); } catch (_) { return null; } })(),
   mode: "place", heatSid: null, dragging: false, needRender: false, saveText: "",
@@ -328,21 +335,13 @@ const chartName = c => `${c.a1l} – ${c.a1r} × ${c.a2l} – ${c.a2r}`;
 const validPt = p => Array.isArray(p) && p.length === 2 && p.every(v => typeof v === "number" && isFinite(v) && v >= -1 && v <= 1);
 function place(el, p) { el.style.left = ((p[0] + 1) / 2 * 100) + "%"; el.style.top = ((1 - p[1]) / 2 * 100) + "%"; }
 const curChart = () => A.liveCharts.find(c => c.id === A.chartId) || null;
-function myPt(sid, cid) { const ch = A.mine[cid || A.chartId]; const p = ch && ch[sid]; return validPt(p) ? p : null; }
-function votesFor(cid, sid) {
-  const out = [];
-  for (const [id, p] of A.votes) { if (id === A.myVoteId) continue; const v = p && p[cid] && p[cid][sid]; if (validPt(v)) out.push(v); }
-  const m = myPt(sid, cid); if (m) out.push(m);
-  return out;
-}
+function myLock(cid) { cid = cid || A.chartId; return A.myVoteId ? A.locks.find(l => l.v === A.myVoteId && l.c === cid) || null : null; }
+const isLocked = cid => !!myLock(cid);
+function myPt(sid, cid) { cid = cid || A.chartId; const L = myLock(cid), src = L ? L.p : A.mine[cid]; const p = src && src[sid]; return validPt(p) ? p : null; }
+// Only locked-in placements count towards the crowd.
+function votesFor(cid, sid) { const out = []; for (const l of A.locks) { if (l.c !== cid) continue; const v = l.p && l.p[sid]; if (validPt(v)) out.push(v); } return out; }
 const avg = pts => { let x = 0, y = 0; for (const p of pts) { x += p[0]; y += p[1]; } return [x / pts.length, y / pts.length]; };
-function voterCount(cid) {
-  const ids = new Set(A.students.map(s => s.id));
-  const has = ch => ch && Object.keys(ch).some(k => ids.has(k) && validPt(ch[k]));
-  let n = 0; for (const [id, p] of A.votes) if (id !== A.myVoteId && has(p && p[cid])) n++;
-  if (has(A.mine[cid])) n++;
-  return n;
-}
+function voterCount(cid) { const ids = new Set(A.students.map(s => s.id)); return A.locks.filter(l => l.c === cid && l.p && Object.keys(l.p).some(k => ids.has(k) && validPt(l.p[k]))).length; }
 const plural = (n, one, many) => `${n} ${n === 1 ? one : many}`;
 function errText(e) { const c = e && (e.code || "").replace(/^(auth|firestore)\//, ""); return c === "permission-denied" ? "permission denied" : (c || (e && e.message) || "unknown error"); }
 function flash(msg) { A.error = msg; renderNotice(); }
@@ -427,8 +426,10 @@ function render() {
   if (app.firstChild !== v.el) app.replaceChildren(v.el);
   if (v.update) v.update();
 }
+const today = () => new Date().toLocaleDateString("en-GB", { day: "numeric", month: "long", year: "numeric" });
+setInterval(() => { const d = $("#date"); if (d && d.textContent !== today()) d.textContent = today(); }, 60000);
 function renderHeader(name) {
-  $("#date").textContent = new Date().toLocaleDateString("en-GB", { day: "numeric", month: "long", year: "numeric" });
+  $("#date").textContent = today();
   const nav = $("#nav"); nav.replaceChildren();
   if (!A.user) return;
   const links = [["vote", "1", "Vote"], ["propose", "2", "Propose a chart"]];
@@ -460,7 +461,7 @@ BUILD.fatal = () => ({ el: h("section", { class: "prose", style: "margin:0 auto"
 /* ---------- 1 Vote ---------- */
 const MODES = [["place", "(a) Your placements"], ["crowd", "(b) Crowd averages"], ["heat", "(c) Heatmap"]];
 BUILD.vote = () => {
-  const intro = h("p", { class: "j lead prose", text: "Place each student on each chart. Placements are anonymous and saved in this browser, so you can return and change them. Once you have placed someone, you can see where everyone else put them." });
+  const intro = h("p", { class: "j lead prose", text: "Place the students you have an opinion about on each chart, then lock in your placements. Until you lock in, they are saved in this browser and you can change them; once locked in they are final, and you can see where everyone else put them. Placements are anonymous." });
   const empty = h("div", { class: "prose" });
   const sel = h("select", { "aria-label": "Chart" });
   sel.addEventListener("change", () => { A.chartId = sel.value; try { localStorage.setItem("vp-chart", sel.value); } catch (_) {} render(); });
@@ -493,7 +494,9 @@ BUILD.vote = () => {
     sel.value = c.id; sel.hidden = !many; only.hidden = many;
     chartLabel.textContent = `Chart ${idx} of ${A.liveCharts.length}:`;
     only.textContent = `${c.a1l}–${c.a1r} versus ${c.a2l}–${c.a2r}`;
-    for (const b of subfigs.children) b.setAttribute("aria-pressed", String(b.dataset.mode === A.mode));
+    const locked = isLocked(c.id);
+    if (!locked && A.mode !== "place") A.mode = "place";
+    for (const b of subfigs.children) { b.setAttribute("aria-pressed", String(b.dataset.mode === A.mode)); b.disabled = b.dataset.mode !== "place" && !locked; b.title = b.disabled ? "Lock in your placements to see this" : ""; }
     F.labels(c);
     drawFigure(c); drawSide(c);
     if (fsIn) { const m = (fsIn === "plot" ? F.layer : side).querySelector(`[data-sid="${CSS.escape(fs)}"]`); if (m) m.focus(); }
@@ -503,30 +506,38 @@ BUILD.vote = () => {
     F.layer.replaceChildren(); F.lines.replaceChildren(); verdict.textContent = "";
     F.cbar.classList.toggle("on", A.mode === "heat");
     if (A.mode !== "heat") { F.canvas.hidden = true; lastHeat = ""; }
-    status.textContent = A.mode === "place" ? A.saveText : "";
+    const locked = isLocked(c.id);
+    status.textContent = A.mode === "place" && !locked ? A.saveText : "";
     if (A.mode === "place") {
-      caption.textContent = "Figure 1: Your placements. Drag names from Table 1 onto the plot, and drag a name off the plot to withdraw it. With a keyboard, Enter places a name at the centre, the arrow keys move it (with Shift for larger steps) and Delete withdraws it.";
-      for (const s of A.students) { const p = myPt(s.id); if (!p) continue; const m = point(s, p, { cls: "mine", label: s.name + ", placed. Arrow keys move, Delete withdraws." }); wireDrag(m); F.layer.append(m); }
+      caption.textContent = locked ? "Figure 1: Your locked-in placements. These are final." : "Figure 1: Your placements. Drag names from Table 1 onto the plot, and drag a name off the plot to withdraw it.";
+      for (const s of A.students) {
+        const p = myPt(s.id); if (!p) continue;
+        const m = point(s, p, { cls: locked ? "mine fixed" : "mine", label: locked ? s.name + ", locked in" : s.name + ", placed. Arrow keys move, Delete withdraws." });
+        if (!locked) wireDrag(m); else m.tabIndex = -1;
+        F.layer.append(m);
+      }
     } else if (A.mode === "crowd") {
-      caption.textContent = `Figure 1: Crowd averages (black) from ${plural(voterCount(c.id), "respondent", "respondents")}, each joined to your own placement (orange ring). Numbers in brackets are vote counts. Only students you have placed are shown; select one to see its heatmap.`;
+      caption.textContent = `Figure 1: Crowd averages (black) from ${plural(voterCount(c.id), "respondent", "respondents")}. Where you placed someone, your placement (orange ring) is joined to the average. Numbers in brackets are vote counts; select a name to see its heatmap.`;
       const X = v => (v + 1) * 50, Y = v => (1 - v) * 50;
       for (const s of A.students) {
-        const mp = myPt(s.id); if (!mp) continue;
-        const pts = votesFor(c.id, s.id), a = avg(pts);
-        const ln = document.createElementNS("http://www.w3.org/2000/svg", "line");
-        for (const [k, v] of [["x1", X(mp[0])], ["y1", Y(mp[1])], ["x2", X(a[0])], ["y2", Y(a[1])]]) ln.setAttribute(k, v);
-        ln.setAttribute("stroke", "#000"); ln.setAttribute("stroke-width", "1"); ln.setAttribute("vector-effect", "non-scaling-stroke");
-        F.lines.append(ln);
-        const r = h("span", { class: "ring" }); place(r, mp); F.layer.append(r);
+        const pts = votesFor(c.id, s.id); if (!pts.length) continue;
+        const a = avg(pts), mp = myPt(s.id);
+        if (mp) {
+          const ln = document.createElementNS("http://www.w3.org/2000/svg", "line");
+          for (const [k, v] of [["x1", X(mp[0])], ["y1", Y(mp[1])], ["x2", X(a[0])], ["y2", Y(a[1])]]) ln.setAttribute(k, v);
+          ln.setAttribute("stroke", "#000"); ln.setAttribute("stroke-width", "1"); ln.setAttribute("vector-effect", "non-scaling-stroke");
+          F.lines.append(ln);
+          const r = h("span", { class: "ring" }); place(r, mp); F.layer.append(r);
+        }
         const m = point(s, a, { cls: "static", n: pts.length, label: `${s.name}: crowd average of ${plural(pts.length, "vote", "votes")}. Show heatmap.` });
         m.addEventListener("click", () => { A.heatSid = s.id; A.mode = "heat"; render(); });
         F.layer.append(m);
       }
     } else {
       const sid = heatTarget();
-      if (!sid) { F.canvas.hidden = true; caption.textContent = "Figure 1: Heatmap. Place a student first, then select them in Table 1."; return; }
+      if (!sid) { F.canvas.hidden = true; caption.textContent = "Figure 1: Heatmap. Nobody has locked in a placement on this chart yet."; return; }
       const s = A.students.find(x => x.id === sid), pts = votesFor(c.id, sid), mp = myPt(sid);
-      caption.textContent = `Figure 1: Density of votes for ${s.name} (n = ${pts.length}), estimated with a Gaussian kernel of bandwidth ${BANDWIDTH} and scaled to its maximum. Dots are individual votes, the orange ring is yours and the labelled point is the mean.`;
+      caption.textContent = `Figure 1: Density of votes for ${s.name} (n = ${pts.length}), estimated with a Gaussian kernel of bandwidth ${BANDWIDTH} and scaled to its maximum. Dots are individual votes${mp ? ", the orange ring is yours" : ""} and the labelled point is the mean.`;
       const key = sid + c.id + JSON.stringify(pts);
       if (key !== lastHeat) { drawHeat(F.canvas, pts); lastHeat = key; }
       F.canvas.hidden = false;
@@ -546,35 +557,55 @@ BUILD.vote = () => {
     const b = h("button", { type: "button", class: "cellbtn", "aria-label": o.label || s.name, disabled: o.disabled }, h("span", { class: "mk " + mk, "aria-hidden": "true" }), h("span", { text: s.name }));
     b.dataset.sid = s.id; return b;
   }
+  function lockBox(c) {
+    const placed = A.students.filter(s => myPt(s.id)).length, box = h("div", { class: "lockbox" });
+    const msg = h("p", { class: "msg" });
+    if (A.confirmLock === c.id) {
+      const yes = h("button", { type: "button", class: "btn", text: `Lock in ${plural(placed, "placement", "placements")}` });
+      const no = h("button", { type: "button", class: "btn ghost", text: "Cancel" });
+      yes.addEventListener("click", async () => { yes.disabled = no.disabled = true; msg.textContent = "Locking in…"; try { await lockIn(); } catch (e) { msg.textContent = "Not locked in: " + errText(e) + "."; yes.disabled = no.disabled = false; } });
+      no.addEventListener("click", () => { A.confirmLock = null; render(); });
+      const left = A.students.length - placed;
+      box.append(h("p", null, `Lock in ${plural(placed, "placement", "placements")} on this chart?${left ? ` The ${plural(left, "student", "students")} you have not placed will stay unplaced.` : ""} This cannot be undone.`), h("div", { class: "row" }, yes, no), msg);
+    } else {
+      const b = h("button", { type: "button", class: "btn", text: "Lock in placements", disabled: !placed || !A.mineLoaded });
+      b.addEventListener("click", () => { A.confirmLock = c.id; render(); });
+      box.append(h("p", null, placed ? "When you have placed everyone you want to, lock in your placements to see the crowd’s view. Locked-in placements are final: you cannot move them or place anyone else on this chart." : "Place at least one student, then lock in your placements to see the crowd’s view."), b);
+    }
+    return box;
+  }
   function drawSide(c) {
     side.replaceChildren();
-    const placed = A.students.filter(s => myPt(s.id)).length;
+    const locked = isLocked(c.id), placed = A.students.filter(s => myPt(s.id)).length;
     if (A.mode === "place") {
       const rows = A.students.map(s => {
-        const p = myPt(s.id), b = nameCell(s, p ? "o" : "", { label: p ? `${s.name}, placed. Drag to move.` : `${s.name}, not placed. Drag onto the plot, or press Enter to place at the centre.` });
-        if (A.mineLoaded) wireDrag(b); else b.disabled = true;
-        return h("tr", { class: "drag" }, h("td", null, b), h("td", { class: "r", text: p ? "placed" : "–" }));
+        const p = myPt(s.id);
+        const b = nameCell(s, p ? "o" : "", { disabled: locked, label: locked ? s.name : p ? `${s.name}, placed. Drag to move.` : `${s.name}, not placed. Drag onto the plot, or press Enter to place at the centre.` });
+        if (!locked) { if (A.mineLoaded) wireDrag(b); else b.disabled = true; }
+        return h("tr", { class: locked ? (p ? "" : "off") : "drag" }, h("td", null, b), h("td", { class: "r", text: p ? (locked ? "locked in" : "placed") : (locked ? "not placed" : "–") }));
       });
-      side.append(table("Table 1: Students. Drag a name onto Figure 1.", [["Student"], ["Status", "r"]], rows, "No students."),
-        h("p", { class: "tabnote", text: A.mineLoaded ? `${placed} of ${A.students.length} placed. Each student you place reveals the crowd’s view of them.` : "Loading your earlier placements…" }));
+      side.append(table(locked ? "Table 1: Your locked-in placements." : "Table 1: Students. Drag a name onto Figure 1.", [["Student"], ["Status", "r"]], rows, "No students."));
+      if (!A.mineLoaded) side.append(h("p", { class: "tabnote", text: "Loading your earlier placements…" }));
+      else if (locked) side.append(h("p", { class: "tabnote", text: "Locked in. See (b) and (c) for the crowd’s view." }));
+      else { side.append(h("p", { class: "tabnote", text: `${placed} of ${A.students.length} placed.` }), lockBox(c)); }
     } else {
       const sid = A.mode === "heat" ? heatTarget() : null;
       const rows = A.students.map(s => {
-        const ok = !!myPt(s.id), n = ok ? votesFor(c.id, s.id).length : null;
-        const b = nameCell(s, ok ? "f" : "", { disabled: !ok, label: ok ? `${s.name}: show heatmap` : `${s.name}: place them first` });
+        const n = votesFor(c.id, s.id).length, ok = n > 0;
+        const b = nameCell(s, myPt(s.id) ? "o" : ok ? "f" : "", { disabled: !ok, label: ok ? `${s.name}: show heatmap` : `${s.name}: no votes yet` });
         if (ok) b.addEventListener("click", () => { A.heatSid = s.id; A.mode = "heat"; render(); });
-        return h("tr", { class: !ok ? "off" : s.id === sid ? "sel pick" : "pick" }, h("td", null, b), h("td", { class: "r", text: ok ? String(n) : "place first" }));
+        return h("tr", { class: !ok ? "off" : s.id === sid ? "sel pick" : "pick" }, h("td", null, b), h("td", { class: "r", text: String(n) }));
       });
       side.append(table(A.mode === "heat" ? "Table 1: Select a student to plot." : "Table 1: Votes per student.", [["Student"], ["n", "r"]], rows, "No students."),
-        h("p", { class: "tabnote", text: "Students you have not placed yet stay hidden, so your own view is not influenced by the crowd." }));
+        h("p", { class: "tabnote", text: "Only locked-in placements are counted. Orange marks students you placed." }));
     }
   }
   return { el, update };
 };
 function heatTarget() {
-  const ok = sid => A.students.some(s => s.id === sid) && myPt(sid);
+  const ok = sid => A.students.some(s => s.id === sid) && votesFor(A.chartId, sid).length > 0;
   if (A.heatSid && ok(A.heatSid)) return A.heatSid;
-  const f = A.students.find(s => myPt(s.id)); return f ? f.id : null;
+  const f = A.students.find(s => ok(s.id)); return f ? f.id : null;
 }
 
 /* ================= data wiring ================= */
@@ -585,7 +616,7 @@ function startSubs() {
   subs.push(store.watchLiveCharts(r => { A.liveCharts = r.map(cleanChart).sort(byCreated); pickChart(); scheduleRender(); }, onErr));
   subs.push(store.watchMyCharts(u.uid, r => { A.myCharts = r.map(cleanChart).sort((a, b) => byCreated(b, a)); scheduleRender(); }, onErr));
   subs.push(store.watchStudents(r => { A.students = r.map(s => ({ id: s.id, name: str(s.name, 60).trim() || "Unnamed", order: +s.order || 0 })).sort((a, b) => a.order - b.order || a.name.localeCompare(b.name)); scheduleRender(); }, onErr));
-  subs.push(store.watchVotes(m => { A.votes = m; scheduleRender(); }, onErr));
+  subs.push(store.watchLocks(r => { A.locks = r.map(l => ({ id: l.id, v: str(l.v, 64), c: str(l.c, 64), p: l.p && typeof l.p === "object" ? l.p : {} })); scheduleRender(); }, onErr));
   if (A.admin) {
     subs.push(store.watchAllCharts(r => { A.allCharts = r.map(cleanChart).sort(byCreated); scheduleRender(); }, onErr));
     subs.push(store.watchAdmins(r => { A.admins = r.sort(); scheduleRender(); }, onErr));
@@ -597,7 +628,7 @@ async function onUser(u) {
   if (u && lastUid === u.uid && A.user && A.user.anon === u.anon) return;
   lastUid = u ? u.uid : null;
   stopSubs(); views = {};
-  Object.assign(A, { user: u, admin: false, error: "", note: "", liveCharts: [], myCharts: [], allCharts: [], students: [], votes: new Map(), admins: [], myVoteId: null, mine: {}, mineLoaded: false, saveText: "" });
+  Object.assign(A, { user: u, admin: false, error: "", note: "", liveCharts: [], myCharts: [], allCharts: [], students: [], locks: [], admins: [], myVoteId: null, mine: {}, mineLoaded: false, saveText: "" });
   if (!u) {
     render();
     try { await store.signInAnon(); }
@@ -636,7 +667,19 @@ async function save() {
 
 /* ---------- drag & keyboard ---------- */
 let drag = null;
-const canPlace = () => viewName() === "vote" && A.mode === "place" && A.mineLoaded && !!curChart();
+const canPlace = () => viewName() === "vote" && A.mode === "place" && A.mineLoaded && !!curChart() && !isLocked();
+async function lockIn() {
+  const c = curChart(); if (!c || isLocked(c.id)) return;
+  const ch = A.mine[c.id] || {}, p = {};
+  for (const sid in ch) if (validPt(ch[sid]) && A.students.some(s => s.id === sid)) p[sid] = ch[sid];
+  if (!Object.keys(p).length) throw new Error("place at least one student first");
+  clearTimeout(saveTimer); await save();
+  while (saving) await new Promise(r => setTimeout(r, 100));
+  if (!A.myVoteId) throw new Error("your placements haven’t been saved yet");
+  await store.lockChart(A.myVoteId, c.id, p);
+  if (!isLocked(c.id)) A.locks = [...A.locks, { id: A.myVoteId + "_" + c.id, v: A.myVoteId, c: c.id, p }];
+  A.confirmLock = null; A.mode = "crowd"; render();
+}
 function wireDrag(el) { el.addEventListener("pointerdown", onDown); el.addEventListener("keydown", onKey); }
 function onDown(e) {
   if (!canPlace() || drag || (e.pointerType === "mouse" && e.button !== 0)) return;
@@ -786,7 +829,7 @@ BUILD.admin = () => {
         A.allCharts.filter(c => c.status !== "proposed").map(c => h("tr", null, ...axes(c), h("td", { text: STATUS[c.status] || c.status }), h("td", { class: "acts" },
           c.status === "live" ? act("Archive", () => store.setChartStatus(c.id, "archived")) : act("Restore", () => store.setChartStatus(c.id, "live")),
           c.status !== "live" ? armed("Delete", () => store.deleteChart(c.id)) : null))), "No charts yet."));
-      box.turnout.replaceChildren(table("Table A.3: Browsers that have placed at least one student.", [["Horizontal"], ["Vertical"], ["n", "r"]],
+      box.turnout.replaceChildren(table("Table A.3: Browsers that have locked in placements.", [["Horizontal"], ["Vertical"], ["n", "r"]],
         A.liveCharts.map(c => h("tr", null, ...axes(c), h("td", { class: "r", text: String(voterCount(c.id)) }))), "No approved charts."));
       box.studs.replaceChildren(table(null, [["Name"], ["", "acts"]],
         A.students.map(s => h("tr", null, h("td", { text: s.name }), h("td", { class: "acts" }, armed("Remove", () => store.removeStudent(s.id))))), "No students yet."));
