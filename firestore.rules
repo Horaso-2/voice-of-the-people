@@ -1,0 +1,82 @@
+rules_version = '2';
+
+// Paste this into Firebase console > Databases & Storage > Firestore > Rules,
+// after editing the line marked EDIT. These rules enforce one vote per browser,
+// anonymity and admin rights; the website only mirrors them.
+//
+// Voters are signed in anonymously (one invisible identity per browser).
+// Admins sign in with Google or an email link.
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // EDIT: the owner is always an admin. Lowercase; same address as ownerEmail in config.js.
+    function ownerEmail() { return 'you@example.ac.uk'; }
+
+    function signedIn() { return request.auth != null; }
+    function email() { return request.auth.token.get('email', '').lower(); }
+    function verified() { return request.auth.token.get('email_verified', false) == true; }
+    function isAdmin() {
+      return signedIn() && verified()
+        && (email() == ownerEmail() || exists(/databases/$(database)/documents/admins/$(email())));
+    }
+    function text(v, n) { return v is string && v.size() > 0 && v.size() <= n; }
+
+    // PhD students: everyone reads, admins manage.
+    match /students/{id} {
+      allow read: if signedIn();
+      allow create, update: if isAdmin()
+        && request.resource.data.keys().hasOnly(['name', 'order'])
+        && text(request.resource.data.name, 60)
+        && request.resource.data.order is number;
+      allow delete: if isAdmin();
+    }
+
+    // Charts: anyone proposes, admins approve. Everyone sees live charts and their own proposals.
+    match /charts/{id} {
+      allow read: if signedIn()
+        && (resource.data.status == 'live' || resource.data.proposedBy == request.auth.uid || isAdmin());
+      allow create: if signedIn()
+        && request.resource.data.keys().hasOnly(['a1l', 'a1r', 'a2l', 'a2r', 'status', 'proposedBy', 'createdAt'])
+        && text(request.resource.data.a1l, 40) && text(request.resource.data.a1r, 40)
+        && text(request.resource.data.a2l, 40) && text(request.resource.data.a2r, 40)
+        && request.resource.data.proposedBy == request.auth.uid
+        && request.resource.data.createdAt == request.time
+        && (request.resource.data.status == 'proposed'
+            || (request.resource.data.status == 'live' && isAdmin()));
+      allow update: if isAdmin()
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status'])
+        && request.resource.data.status in ['live', 'proposed', 'rejected', 'archived'];
+      allow delete: if isAdmin();
+    }
+
+    // Ballot: links a browser's identity to its randomly named vote document.
+    // Only that identity can read it and nobody can change it, so each has exactly one vote.
+    match /ballots/{uid} {
+      allow get: if signedIn() && request.auth.uid == uid;
+      allow create: if signedIn() && request.auth.uid == uid
+        && request.resource.data.keys().hasOnly(['voteId'])
+        && request.resource.data.voteId is string
+        // stops anyone from claiming someone else's existing vote
+        && !exists(/databases/$(database)/documents/votes/$(request.resource.data.voteId));
+    }
+
+    // Votes: readable by everyone (for averages), carry no identity or timestamp.
+    // Only the identity whose ballot points here can write it.
+    match /votes/{voteId} {
+      allow read: if signedIn();
+      allow create, update: if signedIn()
+        && getAfter(/databases/$(database)/documents/ballots/$(request.auth.uid)).data.voteId == voteId
+        && request.resource.data.keys().hasOnly(['p'])
+        && request.resource.data.p is map;
+    }
+
+    // Admins: document id is the admin's lowercase email address.
+    match /admins/{adminEmail} {
+      allow get: if signedIn() && verified() && (adminEmail == email() || isAdmin());
+      allow list: if isAdmin();
+      allow create, update: if isAdmin() && adminEmail == adminEmail.lower()
+        && request.resource.data.keys().hasOnly(['addedBy']);
+      allow delete: if isAdmin() && adminEmail != email();
+    }
+  }
+}
