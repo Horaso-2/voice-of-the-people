@@ -102,7 +102,8 @@ label.f{display:grid;gap:2px;font-style:italic}
 .caption{margin:14px 0 0;font-size:16px;line-height:1.4;text-align:justify;hyphens:auto;-webkit-hyphens:auto}
 .caption b{font-weight:400}
 .status{font-style:italic;color:var(--grey);font-size:15px;margin:6px 0 0}
-.verdict{margin:12px 0 0;font-style:italic}
+.toggle{display:flex;gap:8px;align-items:center;font-size:16px;margin:-6px 0 16px;cursor:pointer;width:max-content;max-width:100%}
+.toggle input{width:auto;margin:0;accent-color:#000;cursor:pointer}
 
 /* points */
 .pt{position:absolute;display:flex;align-items:center;gap:6px;transform:translate(-9px,-50%);padding:3px;margin:0;border:0;background:none;font:inherit;font-size:15px;color:var(--ink);cursor:grab;touch-action:none;user-select:none;-webkit-user-select:none;-webkit-touch-callout:none;z-index:2;white-space:nowrap;line-height:1}
@@ -231,7 +232,7 @@ async function makeLiveStore() {
       if (OWNER && u.email === OWNER) return true;
       try { return (await F.getDoc(ref("admins", u.email))).exists(); } catch (_) { return false; }
     },
-    watchLiveCharts: (cb, err) => F.onSnapshot(F.query(col("charts"), F.where("status", "==", "live")), s => cb(rows(s)), err),
+    watchLiveCharts: (cb, err) => F.onSnapshot(F.query(col("charts"), F.where("status", "in", ["live", "closed"])), s => cb(rows(s)), err),
     watchMyCharts: (uid, cb, err) => F.onSnapshot(F.query(col("charts"), F.where("proposedBy", "==", uid)), s => cb(rows(s)), err),
     watchAllCharts: (cb, err) => F.onSnapshot(col("charts"), s => cb(rows(s)), err),
     watchStudents: (cb, err) => F.onSnapshot(col("students"), s => cb(rows(s)), err),
@@ -284,7 +285,7 @@ function makeDemoStore() {
     onAuth(cb) { setTimeout(() => cb({ uid: "me", anon: false, email: "you@example.ac.uk", name: "You" }), 0); return () => {}; },
     signOut: async () => {}, signInAnon: async () => {}, signInGoogle: async () => {}, sendLink: async () => {}, isLink: () => false,
     isAdmin: async () => true,
-    watchLiveCharts: cb => sub(() => D.charts.filter(c => c.status === "live").map(c => ({ ...c })), cb),
+    watchLiveCharts: cb => sub(() => D.charts.filter(c => c.status === "live" || c.status === "closed").map(c => ({ ...c })), cb),
     watchMyCharts: (uid, cb) => sub(() => D.charts.filter(c => c.proposedBy === uid).map(c => ({ ...c })), cb),
     watchAllCharts: cb => sub(() => D.charts.map(c => ({ ...c })), cb),
     watchStudents: cb => sub(() => D.students.map(s => ({ ...s })), cb),
@@ -337,6 +338,8 @@ function place(el, p) { el.style.left = ((p[0] + 1) / 2 * 100) + "%"; el.style.t
 const curChart = () => A.liveCharts.find(c => c.id === A.chartId) || null;
 function myLock(cid) { cid = cid || A.chartId; return A.myVoteId ? A.locks.find(l => l.v === A.myVoteId && l.c === cid) || null : null; }
 const isLocked = cid => !!myLock(cid);
+const isClosed = c => !!c && c.status === "closed";
+function lockedPt(sid, cid) { const L = myLock(cid); const p = L && L.p && L.p[sid]; return validPt(p) ? p : null; }
 function myPt(sid, cid) { cid = cid || A.chartId; const L = myLock(cid), src = L ? L.p : A.mine[cid]; const p = src && src[sid]; return validPt(p) ? p : null; }
 // Only locked-in placements count towards the crowd.
 function votesFor(cid, sid) { const out = []; for (const l of A.locks) { if (l.c !== cid) continue; const v = l.p && l.p[sid]; if (validPt(v)) out.push(v); } return out; }
@@ -470,10 +473,13 @@ BUILD.vote = () => {
   const subfigs = h("div", { class: "subfigs", role: "group", "aria-label": "Figure" });
   for (const [k, t] of MODES) { const b = h("button", { type: "button", text: t }); b.dataset.mode = k; b.addEventListener("click", () => { A.mode = k; render(); }); subfigs.append(b); }
   const F = makeFigure(); F.plot.id = "plane"; F.layer.id = "layer";
-  const caption = h("p", { class: "caption" }), status = h("p", { class: "status", id: "status", "aria-live": "polite" }), verdict = h("p", { class: "verdict" });
+  const caption = h("p", { class: "caption" }), status = h("p", { class: "status", id: "status", "aria-live": "polite" });
+  const mineBox = h("input", { type: "checkbox" });
+  mineBox.addEventListener("change", () => { A.showMine = mineBox.checked; render(); });
+  const mineToggle = h("label", { class: "toggle" }, mineBox, "Superimpose my placements");
   const side = h("div", { class: "side" });
-  const stage = h("div", { class: "stage" }, h("figure", { style: "margin:0" }, F.fig, caption, status, verdict), side);
-  const body = h("div", null, line, subfigs, stage);
+  const stage = h("div", { class: "stage" }, h("figure", { style: "margin:0" }, F.fig, caption, status), side);
+  const body = h("div", null, line, subfigs, mineToggle, stage);
   const el = h("section", null, sectionHead("1", "Vote"), intro, empty, body);
   let selSig = "", lastHeat = "";
 
@@ -490,25 +496,27 @@ BUILD.vote = () => {
     }
     const idx = A.liveCharts.findIndex(x => x.id === c.id) + 1, many = A.liveCharts.length > 1;
     const sig = A.liveCharts.map(x => x.id + chartName(x)).join("|");
-    if (sig !== selSig) { selSig = sig; sel.replaceChildren(...A.liveCharts.map((x, i) => h("option", { value: x.id, text: `${x.a1l}–${x.a1r} versus ${x.a2l}–${x.a2r}` }))); }
+    if (sig !== selSig) { selSig = sig; sel.replaceChildren(...A.liveCharts.map((x, i) => h("option", { value: x.id, text: `${x.a1l}–${x.a1r} versus ${x.a2l}–${x.a2r}${isClosed(x) ? " (voting closed)" : ""}` }))); }
     sel.value = c.id; sel.hidden = !many; only.hidden = many;
     chartLabel.textContent = `Chart ${idx} of ${A.liveCharts.length}:`;
-    only.textContent = `${c.a1l}–${c.a1r} versus ${c.a2l}–${c.a2r}`;
-    const locked = isLocked(c.id);
-    if (!locked && A.mode !== "place") A.mode = "place";
-    for (const b of subfigs.children) { b.setAttribute("aria-pressed", String(b.dataset.mode === A.mode)); b.disabled = b.dataset.mode !== "place" && !locked; b.title = b.disabled ? "Lock in your placements to see this" : ""; }
+    only.textContent = `${c.a1l}–${c.a1r} versus ${c.a2l}–${c.a2r}${isClosed(c) ? " (voting closed)" : ""}`;
+    const canSee = isLocked(c.id) || isClosed(c);
+    if (!canSee && A.mode !== "place") A.mode = "place";
+    for (const b of subfigs.children) { b.setAttribute("aria-pressed", String(b.dataset.mode === A.mode)); b.disabled = b.dataset.mode !== "place" && !canSee; b.title = b.disabled ? "Lock in your placements to see this" : ""; }
+    mineToggle.hidden = A.mode === "place" || !isLocked(c.id); mineBox.checked = !!A.showMine;
     F.labels(c);
     drawFigure(c); drawSide(c);
     if (fsIn) { const m = (fsIn === "plot" ? F.layer : side).querySelector(`[data-sid="${CSS.escape(fs)}"]`); if (m) m.focus(); }
   }
 
   function drawFigure(c) {
-    F.layer.replaceChildren(); F.lines.replaceChildren(); verdict.textContent = "";
+    F.layer.replaceChildren(); F.lines.replaceChildren();
     F.cbar.classList.toggle("on", A.mode === "heat");
     if (A.mode !== "heat") { F.canvas.hidden = true; lastHeat = ""; }
-    const locked = isLocked(c.id);
-    status.textContent = A.mode === "place" && !locked ? A.saveText : "";
+    const locked = isLocked(c.id), closed = isClosed(c), mine = sid => A.showMine ? lockedPt(sid, c.id) : null;
+    status.textContent = A.mode === "place" && !locked && !closed ? A.saveText : "";
     if (A.mode === "place") {
+      if (closed && !locked) { caption.textContent = "Figure 1: Voting on this chart has closed. See (b) and (c) for the results."; return; }
       caption.textContent = locked ? "Figure 1: Your locked-in placements. These are final." : "Figure 1: Your placements. Drag names from Table 1 onto the plot, and drag a name off the plot to withdraw it.";
       for (const s of A.students) {
         const p = myPt(s.id); if (!p) continue;
@@ -517,11 +525,11 @@ BUILD.vote = () => {
         F.layer.append(m);
       }
     } else if (A.mode === "crowd") {
-      caption.textContent = `Figure 1: Crowd averages (black) from ${plural(voterCount(c.id), "respondent", "respondents")}. Where you placed someone, your placement (orange ring) is joined to the average. Numbers in brackets are vote counts; select a name to see its heatmap.`;
+      caption.textContent = `Figure 1: Crowd averages from ${plural(voterCount(c.id), "respondent", "respondents")}. Numbers in brackets are vote counts; select a name to see its heatmap.${A.showMine ? " Your own placements (orange rings) are joined to the averages." : ""}`;
       const X = v => (v + 1) * 50, Y = v => (1 - v) * 50;
       for (const s of A.students) {
         const pts = votesFor(c.id, s.id); if (!pts.length) continue;
-        const a = avg(pts), mp = myPt(s.id);
+        const a = avg(pts), mp = mine(s.id);
         if (mp) {
           const ln = document.createElementNS("http://www.w3.org/2000/svg", "line");
           for (const [k, v] of [["x1", X(mp[0])], ["y1", Y(mp[1])], ["x2", X(a[0])], ["y2", Y(a[1])]]) ln.setAttribute(k, v);
@@ -536,20 +544,14 @@ BUILD.vote = () => {
     } else {
       const sid = heatTarget();
       if (!sid) { F.canvas.hidden = true; caption.textContent = "Figure 1: Heatmap. Nobody has locked in a placement on this chart yet."; return; }
-      const s = A.students.find(x => x.id === sid), pts = votesFor(c.id, sid), mp = myPt(sid);
-      caption.textContent = `Figure 1: Density of votes for ${s.name} (n = ${pts.length}), estimated with a Gaussian kernel of bandwidth ${BANDWIDTH} and scaled to its maximum. Dots are individual votes${mp ? ", the orange ring is yours" : ""} and the labelled point is the mean.`;
+      const s = A.students.find(x => x.id === sid), pts = votesFor(c.id, sid), mp = mine(sid);
+      caption.textContent = `Figure 1: Votes for ${s.name} (n = ${pts.length}). Dots are individual votes and the labelled point is the mean${mp ? "; the orange ring is your placement" : ""}.`;
       const key = sid + c.id + JSON.stringify(pts);
       if (key !== lastHeat) { drawHeat(F.canvas, pts); lastHeat = key; }
       F.canvas.hidden = false;
       for (const p of pts) { const d = h("span", { class: "vdot" }); place(d, p); F.layer.append(d); }
       if (mp) { const r = h("span", { class: "ring" }); place(r, mp); F.layer.append(r); }
       F.layer.append(point(s, avg(pts), { cls: "quiet", tabindex: "-1", label: s.name + ": crowd average" }));
-      if (mp && pts.length > 1) {
-        const a = avg(pts), dx = a[0] - mp[0], dy = a[1] - mp[1], bits = [];
-        if (Math.abs(dx) >= .12) bits.push("more " + (dx < 0 ? c.a1l : c.a1r));
-        if (Math.abs(dy) >= .12) bits.push("more " + (dy < 0 ? c.a2l : c.a2r));
-        verdict.textContent = bits.length ? `The crowd places ${s.name} ${bits.join(" and ")} than you do.` : `You and the crowd agree about ${s.name}.`;
-      }
     }
   }
 
@@ -577,6 +579,11 @@ BUILD.vote = () => {
   function drawSide(c) {
     side.replaceChildren();
     const locked = isLocked(c.id), placed = A.students.filter(s => myPt(s.id)).length;
+    if (A.mode === "place" && isClosed(c) && !locked) {
+      side.append(table("Table 1: Students.", [["Student"], ["Status", "r"]], A.students.map(s => h("tr", { class: "off" }, h("td", null, nameCell(s, "", { disabled: true })), h("td", { class: "r", text: "–" }))), "No students."),
+        h("p", { class: "tabnote", text: "Voting on this chart has closed. See (b) and (c) for the results." }));
+      return;
+    }
     if (A.mode === "place") {
       const rows = A.students.map(s => {
         const p = myPt(s.id);
@@ -592,12 +599,12 @@ BUILD.vote = () => {
       const sid = A.mode === "heat" ? heatTarget() : null;
       const rows = A.students.map(s => {
         const n = votesFor(c.id, s.id).length, ok = n > 0;
-        const b = nameCell(s, myPt(s.id) ? "o" : ok ? "f" : "", { disabled: !ok, label: ok ? `${s.name}: show heatmap` : `${s.name}: no votes yet` });
+        const b = nameCell(s, A.showMine && lockedPt(s.id, c.id) ? "o" : ok ? "f" : "", { disabled: !ok, label: ok ? `${s.name}: show heatmap` : `${s.name}: no votes yet` });
         if (ok) b.addEventListener("click", () => { A.heatSid = s.id; A.mode = "heat"; render(); });
         return h("tr", { class: !ok ? "off" : s.id === sid ? "sel pick" : "pick" }, h("td", null, b), h("td", { class: "r", text: String(n) }));
       });
       side.append(table(A.mode === "heat" ? "Table 1: Select a student to plot." : "Table 1: Votes per student.", [["Student"], ["n", "r"]], rows, "No students."),
-        h("p", { class: "tabnote", text: "Only locked-in placements are counted. Orange marks students you placed." }));
+        h("p", { class: "tabnote", text: "Only locked-in placements are counted." + (A.showMine && isLocked(c.id) ? " Orange marks students you placed." : "") }));
     }
   }
   return { el, update };
@@ -667,9 +674,10 @@ async function save() {
 
 /* ---------- drag & keyboard ---------- */
 let drag = null;
-const canPlace = () => viewName() === "vote" && A.mode === "place" && A.mineLoaded && !!curChart() && !isLocked();
+const canPlace = () => viewName() === "vote" && A.mode === "place" && A.mineLoaded && !!curChart() && !isLocked() && !isClosed(curChart());
 async function lockIn() {
   const c = curChart(); if (!c || isLocked(c.id)) return;
+  if (isClosed(c)) throw new Error("voting on this chart has closed");
   const ch = A.mine[c.id] || {}, p = {};
   for (const sid in ch) if (validPt(ch[sid]) && A.students.some(s => s.id === sid)) p[sid] = ch[sid];
   if (!Object.keys(p).length) throw new Error("place at least one student first");
@@ -749,7 +757,7 @@ function onKey(e) {
 
 /* ---------- 2 Propose ---------- */
 const PH = { a1l: "Axis 1 Left", a1r: "Axis 1 Right", a2l: "Axis 2 Left", a2r: "Axis 2 Right" };
-const STATUS = { live: "approved", proposed: "under review", rejected: "declined", archived: "archived" };
+const STATUS = { live: "open for voting", closed: "voting closed", proposed: "under review", rejected: "declined", archived: "archived" };
 BUILD.propose = () => {
   const inp = k => h("input", { name: k, required: true, maxlength: 40, placeholder: PH[k], autocomplete: "off" });
   const I = { a1l: inp("a1l"), a1r: inp("a1r"), a2l: inp("a2l"), a2r: inp("a2r") };
@@ -825,11 +833,14 @@ BUILD.admin = () => {
       example.hidden = A.students.length > 0 || A.allCharts.length > 0;
       box.pending.replaceChildren(table("Table A.1: Approve a proposal to put it up for voting.", [["Horizontal"], ["Vertical"], ["", "acts"]],
         A.allCharts.filter(c => c.status === "proposed").map(c => h("tr", null, ...axes(c), h("td", { class: "acts" }, act("Approve", () => store.setChartStatus(c.id, "live"), ""), act("Decline", () => store.setChartStatus(c.id, "rejected"))))), "Nothing to review."));
-      box.charts.replaceChildren(table("Table A.2: Archiving hides a chart and keeps its votes.", [["Horizontal"], ["Vertical"], ["Status"], ["", "acts"]],
+      box.charts.replaceChildren(table("Table A.2: Closing a chart ends its vote and shows the results to everyone; votes already cast are kept. Archiving hides a chart and keeps its votes. Download saves the results.", [["Horizontal"], ["Vertical"], ["Status"], ["", "acts"]],
         A.allCharts.filter(c => c.status !== "proposed").map(c => h("tr", null, ...axes(c), h("td", { text: STATUS[c.status] || c.status }), h("td", { class: "acts" },
-          c.status === "live" ? act("Archive", () => store.setChartStatus(c.id, "archived")) : act("Restore", () => store.setChartStatus(c.id, "live")),
-          c.status !== "live" ? armed("Delete", () => store.deleteChart(c.id)) : null))), "No charts yet."));
-      box.turnout.replaceChildren(table("Table A.3: Browsers that have locked in placements.", [["Horizontal"], ["Vertical"], ["n", "r"]],
+          c.status === "live" ? act("Close voting", () => store.setChartStatus(c.id, "closed"), "") : null,
+          c.status === "closed" ? act("Reopen voting", () => store.setChartStatus(c.id, "live")) : null,
+          c.status === "live" || c.status === "closed" ? act("Archive", () => store.setChartStatus(c.id, "archived")) : act("Restore", () => store.setChartStatus(c.id, "live")),
+          act("Download", () => exportChart(c)),
+          c.status === "archived" || c.status === "rejected" ? armed("Delete", () => store.deleteChart(c.id)) : null))), "No charts yet."));
+      box.turnout.replaceChildren(table("Table A.3: Browsers that have locked in placements, per open or closed chart.", [["Horizontal"], ["Vertical"], ["n", "r"]],
         A.liveCharts.map(c => h("tr", null, ...axes(c), h("td", { class: "r", text: String(voterCount(c.id)) }))), "No approved charts."));
       box.studs.replaceChildren(table(null, [["Name"], ["", "acts"]],
         A.students.map(s => h("tr", null, h("td", { text: s.name }), h("td", { class: "acts" }, armed("Remove", () => store.removeStudent(s.id))))), "No students yet."));
@@ -840,6 +851,122 @@ BUILD.admin = () => {
     },
   };
 };
+
+/* ---------- results export (admin) ---------- */
+// A small uncompressed ZIP writer, so the export needs no external library.
+const CRC_T = (() => { const t = new Uint32Array(256); for (let n = 0; n < 256; n++) { let c = n; for (let k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320 ^ (c >>> 1) : c >>> 1; t[n] = c >>> 0; } return t; })();
+function crc32(b) { let c = 0xFFFFFFFF; for (let i = 0; i < b.length; i++) c = CRC_T[(c ^ b[i]) & 255] ^ (c >>> 8); return (c ^ 0xFFFFFFFF) >>> 0; }
+function makeZip(files) {
+  const enc = new TextEncoder(), parts = [], central = []; let off = 0;
+  const d = new Date(), tm = ((d.getHours() << 11) | (d.getMinutes() << 5) | (d.getSeconds() >> 1)) & 0xFFFF, dt = (((d.getFullYear() - 1980) << 9) | ((d.getMonth() + 1) << 5) | d.getDate()) & 0xFFFF;
+  for (const f of files) {
+    const nm = enc.encode(f.name), data = f.data, crc = crc32(data);
+    const lh = new DataView(new ArrayBuffer(30));
+    lh.setUint32(0, 0x04034b50, true); lh.setUint16(4, 20, true); lh.setUint16(6, 0x0800, true); lh.setUint16(10, tm, true); lh.setUint16(12, dt, true);
+    lh.setUint32(14, crc, true); lh.setUint32(18, data.length, true); lh.setUint32(22, data.length, true); lh.setUint16(26, nm.length, true);
+    parts.push(new Uint8Array(lh.buffer), nm, data);
+    const ch = new DataView(new ArrayBuffer(46));
+    ch.setUint32(0, 0x02014b50, true); ch.setUint16(4, 20, true); ch.setUint16(6, 20, true); ch.setUint16(8, 0x0800, true); ch.setUint16(12, tm, true); ch.setUint16(14, dt, true);
+    ch.setUint32(16, crc, true); ch.setUint32(20, data.length, true); ch.setUint32(24, data.length, true); ch.setUint16(28, nm.length, true); ch.setUint32(42, off, true);
+    central.push(new Uint8Array(ch.buffer), nm);
+    off += 30 + nm.length + data.length;
+  }
+  const size = central.reduce((a, b) => a + b.length, 0), end = new DataView(new ArrayBuffer(22));
+  end.setUint32(0, 0x06054b50, true); end.setUint16(8, files.length, true); end.setUint16(10, files.length, true); end.setUint32(12, size, true); end.setUint32(16, off, true);
+  return new Blob([...parts, ...central, new Uint8Array(end.buffer)], { type: "application/zip" });
+}
+const slug = t => String(t).toLowerCase().normalize("NFKD").replace(/[^\w]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 60) || "item";
+const csvCell = v => { const t = String(v); return /[",\n]/.test(t) ? `"${t.replace(/"/g, '""')}"` : t; };
+const csv = rows => rows.map(r => r.map(csvCell).join(",")).join("\n") + "\n";
+const f4 = v => (Math.round(v * 10000) / 10000).toString();
+function densityGrid(pts, N) {
+  const k = 1 / (2 * BANDWIDTH * BANDWIDTH), g = new Float32Array(N * N); let max = 0;
+  for (let j = 0; j < N; j++) { const y = 1 - 2 * j / (N - 1); for (let i = 0; i < N; i++) { const x = -1 + 2 * i / (N - 1); let s = 0; for (const p of pts) { const dx = x - p[0], dy = y - p[1]; s += Math.exp(-(dx * dx + dy * dy) * k); } g[j * N + i] = s; if (s > max) max = s; } }
+  if (max) for (let q = 0; q < g.length; q++) g[q] /= max;
+  return g;
+}
+async function figurePng(c, title, bg, fg) {
+  try { await document.fonts.ready; } catch (_) {}
+  const W = 1400, L = 150, T = 150, S = 1100, cv = document.createElement("canvas"); cv.width = W; cv.height = W;
+  const x = cv.getContext("2d"), P = p => [L + (p[0] + 1) / 2 * S, T + (1 - p[1]) / 2 * S], serif = '"CMU Serif", Georgia, serif';
+  x.fillStyle = "#fff"; x.fillRect(0, 0, W, W);
+  if (bg) bg(x, L, T, S);
+  x.save(); x.setLineDash([10, 10]); x.strokeStyle = "rgba(0,0,0,.4)"; x.lineWidth = 1.5; x.beginPath();
+  x.moveTo(L + S / 2, T); x.lineTo(L + S / 2, T + S); x.moveTo(L, T + S / 2); x.lineTo(L + S, T + S / 2); x.stroke(); x.restore();
+  x.strokeStyle = "#000"; x.lineWidth = 2; x.strokeRect(L, T, S, S);
+  fg(x, P, serif);
+  x.fillStyle = "#000"; x.font = `italic 30px ${serif}`; x.textBaseline = "top";
+  x.textAlign = "left"; x.fillText("← " + c.a1l, L, T + S + 18); x.textAlign = "right"; x.fillText(c.a1r + " →", L + S, T + S + 18);
+  x.save(); x.translate(L - 18, T + S); x.rotate(-Math.PI / 2); x.textBaseline = "bottom";
+  x.textAlign = "left"; x.fillText("← " + c.a2l, 0, 0); x.textAlign = "right"; x.fillText(c.a2r + " →", S, 0); x.restore();
+  x.font = `40px ${serif}`; x.textAlign = "center"; x.textBaseline = "alphabetic"; x.fillText(title, W / 2, T - 50);
+  const blob = await new Promise(r => cv.toBlob(r, "image/png"));
+  return new Uint8Array(await blob.arrayBuffer());
+}
+function haloText(x, t, px, py, font, align) {
+  x.font = font; x.textAlign = align || "left"; x.textBaseline = "middle";
+  x.lineJoin = "round"; x.strokeStyle = "#fff"; x.lineWidth = 7; x.strokeText(t, px, py); x.fillStyle = "#000"; x.fillText(t, px, py);
+}
+async function exportChart(c) {
+  const enc = new TextEncoder(), files = [], dir = slug(`${c.a1l} ${c.a1r} vs ${c.a2l} ${c.a2r}`) + "/";
+  const add = (name, data) => files.push({ name: dir + name, data: typeof data === "string" ? enc.encode(data) : data });
+  const locks = A.locks.filter(l => l.c === c.id).sort((a, b) => a.id < b.id ? -1 : 1);
+  const respondent = new Map(locks.map((l, i) => [l.v, i + 1]));
+  const known = new Map(A.students.map(s => [s.id, s.name]));
+  const sids = []; for (const l of locks) for (const sid in l.p) if (validPt(l.p[sid]) && !sids.includes(sid)) sids.push(sid);
+  sids.sort((a, b) => { const ia = A.students.findIndex(s => s.id === a), ib = A.students.findIndex(s => s.id === b); return (ia < 0 ? 1e9 : ia) - (ib < 0 ? 1e9 : ib); });
+  const name = sid => known.get(sid) || `Removed student (${sid})`;
+  const used = new Set(), fileName = sid => { let b = slug(name(sid)), n = b, i = 2; while (used.has(n)) n = `${b}-${i++}`; used.add(n); return n; };
+  const points = [["student", "respondent", "x", "y"]], averages = [["student", "n", "mean_x", "mean_y", "sd_x", "sd_y"]], means = [];
+  for (const sid of sids) {
+    const pts = []; for (const l of locks) { const p = l.p[sid]; if (validPt(p)) { pts.push(p); points.push([name(sid), respondent.get(l.v), f4(p[0]), f4(p[1])]); } }
+    const m = avg(pts), sd = k => Math.sqrt(pts.reduce((a, p) => a + (p[k] - m[k]) ** 2, 0) / (pts.length > 1 ? pts.length - 1 : 1));
+    averages.push([name(sid), pts.length, f4(m[0]), f4(m[1]), pts.length > 1 ? f4(sd(0)) : "", pts.length > 1 ? f4(sd(1)) : ""]);
+    means.push({ sid, pts, m });
+  }
+  add("points.csv", csv(points)); add("averages.csv", csv(averages));
+  add("averages.png", await figurePng(c, `Crowd averages (${plural(locks.length, "respondent", "respondents")})`, null, (x, P, serif) => {
+    for (const { sid, pts, m } of means) { const [px, py] = P(m); x.beginPath(); x.arc(px, py, 10, 0, 7); x.fillStyle = "#000"; x.fill(); x.lineWidth = 3; x.strokeStyle = "#fff"; x.stroke(); haloText(x, `${name(sid)} (${pts.length})`, px + 18, py, `30px ${serif}`); }
+  }));
+  for (const { sid, pts, m } of means) {
+    const fn = fileName(sid), G = 51, g = densityGrid(pts, G), rows = [["x", "y", "density"]];
+    for (let j = 0; j < G; j++) for (let i = 0; i < G; i++) rows.push([f4(-1 + 2 * i / (G - 1)), f4(1 - 2 * j / (G - 1)), f4(g[j * G + i])]);
+    add(`density/${fn}.csv`, csv(rows));
+    add(`heatmaps/${fn}.png`, await figurePng(c, `${name(sid)} (n = ${pts.length})`, (x, L, T, S) => {
+      const hc = document.createElement("canvas"); drawHeat(hc, pts); x.imageSmoothingEnabled = true; x.drawImage(hc, L, T, S, S);
+    }, (x, P, serif) => {
+      for (const p of pts) { const [px, py] = P(p); x.beginPath(); x.arc(px, py, 6, 0, 7); x.fillStyle = "#000"; x.fill(); x.lineWidth = 2; x.strokeStyle = "#fff"; x.stroke(); }
+      const [mx, my] = P(m); x.beginPath(); x.arc(mx, my, 11, 0, 7); x.fillStyle = "#fff"; x.fill(); x.lineWidth = 3; x.strokeStyle = "#000"; x.stroke();
+      x.font = `30px ${serif}`; const t = "mean", w = x.measureText(t).width; x.fillStyle = "#fff"; x.fillRect(mx + 18, my - 22, w + 16, 44); x.lineWidth = 2; x.strokeRect(mx + 18, my - 22, w + 16, 44);
+      x.fillStyle = "#000"; x.textAlign = "left"; x.textBaseline = "middle"; x.fillText(t, mx + 26, my + 1);
+    }));
+  }
+  const when = new Date();
+  add("README.txt", [
+    "Voice of the People: results export",
+    "",
+    `Chart: ${c.a1l} – ${c.a1r} (horizontal) versus ${c.a2l} – ${c.a2r} (vertical)`,
+    `Status: ${STATUS[c.status] || c.status}`,
+    `Exported: ${when.toLocaleString("en-GB")}`,
+    `Respondents (browsers that locked in placements): ${locks.length}`,
+    "",
+    "Coordinates run from -1 to 1 on both axes:",
+    `  x = -1 is "${c.a1l}", x = 1 is "${c.a1r}"`,
+    `  y = -1 is "${c.a2l}", y = 1 is "${c.a2r}"`,
+    "",
+    "points.csv    every locked-in placement. 'respondent' is an anonymous number,",
+    "              the same for one person across all students on this chart.",
+    "averages.csv  number of votes, mean position and standard deviation per student.",
+    "averages.png  the crowd-average figure.",
+    "heatmaps/     one heatmap figure per student (jet colour scale; dots are votes).",
+    "density/      the heatmap values on a 51 x 51 grid: a Gaussian kernel density",
+    `              estimate with bandwidth ${BANDWIDTH}, scaled so the maximum is 1.`,
+    "",
+  ].join("\n"));
+  const blob = makeZip(files), a = document.createElement("a");
+  a.href = URL.createObjectURL(blob); a.download = `voice-of-the-people_${dir.slice(0, -1)}_${when.toISOString().slice(0, 10)}.zip`;
+  document.body.append(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(a.href), 30000);
+}
 
 /* ---------- sign in ---------- */
 BUILD.signin = () => {
