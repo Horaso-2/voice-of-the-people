@@ -529,7 +529,7 @@ BUILD.vote = () => {
       if (closed && !locked) { caption.textContent = "Figure 1: Voting on this chart has closed. See (b) and (c) for the results."; return; }
       caption.textContent = closed ? "Figure 1: Your locked-in placements. Voting on this chart has closed."
         : allLocked ? "Figure 1: Your locked-in placements. These are final."
-        : locked ? "Figure 1: Your placements. Names with a double ring are locked in and can no longer be moved; drag the others from Table 1 onto the plot, and drag them off to withdraw."
+        : locked ? "Figure 1: Your placements. Names you've already locked in cannot be changed. Drag the others from Table 1 onto the plot, and drag them off to withdraw."
         : "Figure 1: Your placements. Drag names from Table 1 onto the plot, and drag a name off the plot to withdraw it.";
       for (const s of A.students) {
         const fixed = !!lockedPt(s.id, c.id) || closed, p = fixed ? lockedPt(s.id, c.id) : myPt(s.id); if (!p) continue;
